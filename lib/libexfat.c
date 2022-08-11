@@ -6,7 +6,13 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#ifdef __linux__
 #include <sys/sysmacros.h>
+#elif __APPLE__
+#include <sys/disk.h>
+#elif defined(__OpenBSD__) || defined(__NetBSD__) || defined(__FreeBSD__) 
+#error "Implement for BSDs"
+#endif
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -88,7 +94,7 @@ wchar_t exfat_bad_char(wchar_t w)
 }
 
 void boot_calc_checksum(unsigned char *sector, unsigned short size,
-		bool is_boot_sec, __le32 *checksum)
+		bool is_boot_sec, uint32_t *checksum)
 {
 	unsigned int index;
 
@@ -156,6 +162,7 @@ int exfat_get_blk_dev_info(struct exfat_user_input *ui,
 			strerror(errno));
 		return -1;
 	}
+#ifdef __linux__
 	blk_dev_size = lseek(fd, 0, SEEK_END);
 	if (blk_dev_size <= 0) {
 		exfat_err("invalid block device size(%s)\n",
@@ -169,8 +176,7 @@ int exfat_get_blk_dev_info(struct exfat_user_input *ui,
 		char pathname[sizeof("/sys/dev/block/4294967295:4294967295/start")];
 		FILE *fp;
 
-		snprintf(pathname, sizeof(pathname), "/sys/dev/block/%u:%u/start",
-			major(st.st_rdev), minor(st.st_rdev));
+		snprintf(pathname, sizeof(pathname), "/sys/dev/block/%u:%u/start", major(st.st_rdev), minor(st.st_rdev));
 		fp = fopen(pathname, "r");
 		if (fp != NULL) {
 			if (fscanf(fp, "%llu", &blk_dev_offset) == 1) {
@@ -183,7 +189,24 @@ int exfat_get_blk_dev_info(struct exfat_user_input *ui,
 			fclose(fp);
 		}
 	}
+#elif defined(__APPLE__)
+	unsigned long long sectorcount = 0, sectorsize = 0;
 
+	if (ioctl(fd, DKIOCGETBLOCKCOUNT, &sectorcount) < 0){
+		exfat_err("couldn't get sector count");
+		abort();
+	}
+
+	if (ioctl(fd, DKIOCGETBLOCKSIZE, &sectorsize) < 0){
+        exfat_info("couldn't get sector size");
+		sectorsize = DEFAULT_SECTOR_SIZE;
+    }
+
+	blk_dev_size = sectorcount * sectorsize;
+
+#elif defined(__OpenBSD__) || defined(__NetBSD__) || defined(__FreeBSD__) 
+#error "Implement for BSDs"
+#endif
 	bd->dev_fd = fd;
 	bd->offset = blk_dev_offset;
 	bd->size = blk_dev_size;
@@ -192,9 +215,14 @@ int exfat_get_blk_dev_info(struct exfat_user_input *ui,
 
 	if (!ui->boundary_align)
 		ui->boundary_align = DEFAULT_BOUNDARY_ALIGNMENT;
-
+#ifdef __linux__
 	if (ioctl(fd, BLKSSZGET, &bd->sector_size) < 0)
 		bd->sector_size = DEFAULT_SECTOR_SIZE;
+#elif defined(__APPLE__)
+	bd->sector_size = sectorsize;
+#elif defined(__OpenBSD__) || defined(__NetBSD__) || defined(__FreeBSD__) 
+#error "Implement for BSDs"
+#endif
 	bd->sector_size_bits = sector_size_bits(bd->sector_size);
 	bd->num_sectors = blk_dev_size / bd->sector_size;
 	bd->num_clusters = blk_dev_size / ui->cluster_size;
@@ -224,7 +252,7 @@ ssize_t exfat_write(int fd, void *buf, size_t size, off_t offset)
 	return pwrite(fd, buf, size, offset);
 }
 
-size_t exfat_utf16_len(const __le16 *str, size_t max_size)
+size_t exfat_utf16_len(const uint16_t *str, size_t max_size)
 {
 	size_t i = 0;
 
@@ -233,7 +261,7 @@ size_t exfat_utf16_len(const __le16 *str, size_t max_size)
 	return i;
 }
 
-ssize_t exfat_utf16_enc(const char *in_str, __u16 *out_str, size_t out_size)
+ssize_t exfat_utf16_enc(const char *in_str, uint16_t *out_str, size_t out_size)
 {
 	size_t mbs_len, out_len, i;
 	wchar_t *wcs;
@@ -280,7 +308,7 @@ ssize_t exfat_utf16_enc(const char *in_str, __u16 *out_str, size_t out_size)
 	return 2*out_len;
 }
 
-ssize_t exfat_utf16_dec(const __u16 *in_str, size_t in_len,
+ssize_t exfat_utf16_dec(const uint16_t *in_str, size_t in_len,
 			char *out_str, size_t out_size)
 {
 	size_t wcs_len, out_len, c_len, i;
@@ -387,7 +415,7 @@ off_t exfat_get_root_entry_offset(struct exfat_blk_dev *bd)
 char *exfat_conv_volume_label(struct exfat_dentry *vol_entry)
 {
 	char *volume_label;
-	__le16 disk_label[VOLUME_LABEL_MAX_LEN];
+	uint16_t disk_label[VOLUME_LABEL_MAX_LEN];
 
 	volume_label = malloc(VOLUME_LABEL_BUFFER_SIZE);
 	if (!volume_label)
@@ -443,7 +471,7 @@ int exfat_set_volume_label(struct exfat_blk_dev *bd,
 {
 	struct exfat_dentry vol;
 	int nbytes;
-	__u16 volume_label[VOLUME_LABEL_MAX_LEN];
+	uint16_t volume_label[VOLUME_LABEL_MAX_LEN];
 	int volume_label_len;
 
 	volume_label_len = exfat_utf16_enc(label_input,
@@ -475,7 +503,8 @@ int exfat_read_sector(struct exfat_blk_dev *bd, void *buf, unsigned int sec_off)
 	int ret;
 	unsigned long long offset = sec_off * bd->sector_size;
 
-	ret = pread(bd->dev_fd, buf, bd->sector_size, offset);
+	lseek(bd->dev_fd, offset, SEEK_SET);
+	ret = read(bd->dev_fd, buf, bd->sector_size);
 	if (ret < 0) {
 		exfat_err("read failed, sec_off : %u\n", sec_off);
 		return -1;
@@ -489,7 +518,8 @@ int exfat_write_sector(struct exfat_blk_dev *bd, void *buf,
 	int bytes;
 	unsigned long long offset = sec_off * bd->sector_size;
 
-	bytes = pwrite(bd->dev_fd, buf, bd->sector_size, offset);
+	lseek(bd->dev_fd, offset, SEEK_SET);
+	bytes = write(bd->dev_fd, buf, bd->sector_size);
 	if (bytes != (int)bd->sector_size) {
 		exfat_err("write failed, sec_off : %u, bytes : %d\n", sec_off,
 			bytes);
@@ -501,7 +531,7 @@ int exfat_write_sector(struct exfat_blk_dev *bd, void *buf,
 int exfat_write_checksum_sector(struct exfat_blk_dev *bd,
 		unsigned int checksum, bool is_backup)
 {
-	__le32 *checksum_buf;
+	uint32_t *checksum_buf;
 	int ret = 0;
 	unsigned int i;
 	unsigned int sec_idx = CHECKSUM_SEC_IDX;
